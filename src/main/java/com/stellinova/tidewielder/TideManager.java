@@ -37,7 +37,8 @@ import java.util.UUID;
 /**
  * TideWielder core — Maelstrom / Bubble / Tidepool / Surge / Typhoon + Tide Echo passive.
  *
- * v0.4.1 — Winder-style input (movement + F + sneak only), max FX but optimized, aerial Typhoon.
+ * v0.4.2 — Hunger cost, longer cooldowns, buffed Bubble prison, stronger Surge at Evo 3,
+ *          and more impactful Typhoon damage pulses.
  *
  * Controls (when attuned to TideWielder):
  *  - Tap F (swap-hand)                    -> Surge
@@ -70,12 +71,12 @@ public class TideManager implements Listener {
 
     private BukkitTask tickTask;
 
-    // Cooldowns (ms)
-    private static final long MAELSTROM_CD_BASE = 10_000L;
-    private static final long BUBBLE_CD_BASE    = 14_000L;
-    private static final long TIDEPOOL_CD_BASE  = 10_000L;
-    private static final long SURGE_CD_BASE     = 8_000L;
-    private static final long TYPHOON_CD_BASE   = 120_000L;
+    // Cooldowns (ms) — slightly longer to reduce spam
+    private static final long MAELSTROM_CD_BASE = 15_000L;
+    private static final long BUBBLE_CD_BASE    = 20_000L;
+    private static final long TIDEPOOL_CD_BASE  = 15_000L;
+    private static final long SURGE_CD_BASE     = 12_000L;
+    private static final long TYPHOON_CD_BASE   = 160_000L;
 
     // Typhoon timings
     private static final long TYPHOON_DURATION_BASE = 4_000L;
@@ -321,13 +322,22 @@ public class TideManager implements Listener {
     }
 
     // ------------------------------------------------------------
-    // Abilities (with optimized FX) + Tide Echo hooks
+    // Abilities (with optimized FX) + Tide Echo + hunger usage
     // ------------------------------------------------------------
+
+    private void consumeHunger(Player p, int amount) {
+        if (amount <= 0) return;
+        int current = p.getFoodLevel();
+        int next = Math.max(0, current - amount);
+        p.setFoodLevel(next);
+    }
 
     private void triggerMaelstrom(Player p) {
         long now = System.currentTimeMillis();
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getMaelstromReadyAt(), "Maelstrom")) return;
+
+        consumeHunger(p, 2);
 
         boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
@@ -400,6 +410,8 @@ public class TideManager implements Listener {
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getBubbleReadyAt(), "Bubble")) return;
 
+        consumeHunger(p, 2);
+
         boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
         double radius = 4.0;
@@ -437,20 +449,30 @@ public class TideManager implements Listener {
             }
         }
 
+        // Duration: 3–7.5s depending on Evo
+        int durTicks = 60 + (evoLvl * 30); // 0:3s, 1:4.5s, 2:6s, 3:7.5s
+
+        // Caster buff inside prison window: Strength (Evo2+ is stronger)
+        int strAmp = (evoLvl >= 2 ? 1 : 0);
+        p.addPotionEffect(new PotionEffect(
+                PotionEffectType.INCREASE_DAMAGE,
+                durTicks,
+                strAmp,
+                false, true, true
+        ));
+
         for (Entity e : p.getWorld().getNearbyEntities(c, radius, radius, radius)) {
             if (!(e instanceof LivingEntity le) || le == p) continue;
-            int baseDur = 60 + (evoLvl * 20);
-            int dur = baseDur + (echo ? 20 : 0);
 
             le.addPotionEffect(new PotionEffect(
                     PotionEffectType.SLOWNESS,
-                    dur,
+                    durTicks,
                     3,
                     false, true, true
             ));
             le.addPotionEffect(new PotionEffect(
                     PotionEffectType.WEAKNESS,
-                    dur,
+                    durTicks,
                     0,
                     false, true, true
             ));
@@ -464,9 +486,9 @@ public class TideManager implements Listener {
             }
         }
 
-        long dur = 2000L + evoLvl * 1000L;
+        long durMs = durTicks * 50L;
         d.setInBubble(true);
-        d.setBubbleExpiresAt(now + dur);
+        d.setBubbleExpiresAt(now + durMs);
 
         long cd = cdFromEvo(p, BUBBLE_CD_BASE);
         d.setBubbleReadyAt(now + cd);
@@ -479,6 +501,8 @@ public class TideManager implements Listener {
         long now = System.currentTimeMillis();
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getTidepoolReadyAt(), "Tidepool")) return;
+
+        consumeHunger(p, 1);
 
         boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
@@ -557,13 +581,23 @@ public class TideManager implements Listener {
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getSurgeReadyAt(), "Surge")) return;
 
+        consumeHunger(p, 1);
+
         boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
         double radius = SURGE_RADIUS * TideEvoBridge.m(p, "surge");
         double baseForce = SURGE_FORCE * TideEvoBridge.m(p, "surge");
 
+        // Evo scaling: MUCH stronger at Evo 3
+        double evoBoost = switch (evoLvl) {
+            case 1 -> 1.15;
+            case 2 -> 1.35;
+            case 3 -> 1.80; // big punch at Evo 3
+            default -> 1.0;
+        };
+
         // Tide Echo synergy: stronger wave when chaining abilities
-        double force = baseForce * (echo ? 1.25 : 1.0);
+        double force = baseForce * evoBoost * (echo ? 1.25 : 1.0);
 
         Location c = p.getLocation();
         Vector dir = p.getLocation().getDirection().normalize();
@@ -619,6 +653,8 @@ public class TideManager implements Listener {
         long now = System.currentTimeMillis();
         TidePlayerData d = data(p);
         if (!TideAccessBridge.canUseTide(p)) return;
+
+        consumeHunger(p, 2);
 
         boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
@@ -739,6 +775,19 @@ public class TideManager implements Listener {
                                     16, 2.3, 1.4, 2.3, 0.03);
 
                             w.playSound(c, Sound.WEATHER_RAIN_ABOVE, 0.7f, 1.3f);
+
+                            // NEW: Typhoon damage pulses around the player
+                            double radius = 5.0;
+                            for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), radius, radius, radius)) {
+                                if (!(e instanceof LivingEntity le) || le == p) continue;
+                                Location el = le.getLocation();
+                                el.getWorld().spawnParticle(Particle.DRIPPING_WATER, el.add(0, 1.0, 0),
+                                        6, 0.4, 0.5, 0.4, 0.03);
+                                le.damage(0.75, p); // small but frequent damage
+                                Vector push = safeUnit(le.getLocation().toVector().subtract(p.getLocation().toVector()));
+                                push.setY(0.2);
+                                le.setVelocity(safeFinite(le.getVelocity().add(push.multiply(0.25))));
+                            }
                         }
                     }
                 }
