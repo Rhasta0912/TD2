@@ -37,8 +37,8 @@ import java.util.UUID;
 /**
  * TideWielder core — Maelstrom / Bubble / Tidepool / Surge / Typhoon + Tide Echo passive.
  *
- * v0.4.3 — Hunger cost, longer cooldowns, buffed Bubble prison, stronger Surge at Evo 3,
- *          and more impactful Typhoon damage pulses. Strength effect fixed for 1.21.8.
+ * v0.4.4 — Hunger cost, longer cooldowns, buffed Bubble prison, stronger Surge at Evo 3,
+ *          impactful Typhoon pulses, and fixed recursive damage loop in Typhoon hit handling.
  *
  * Controls (when attuned to TideWielder):
  *  - Tap F (swap-hand)                    -> Surge
@@ -282,8 +282,13 @@ public class TideManager implements Listener {
             c.getWorld().playSound(c, Sound.WEATHER_RAIN_ABOVE, 0.8f, 1.4f);
 
             if (target instanceof LivingEntity le) {
-                le.damage(0.5, p);
-                le.setVelocity(le.getVelocity().add(new Vector(0, 0.15, 0)));
+                // Add bonus damage without starting a new damage event (prevents recursion)
+                e.setDamage(e.getDamage() + 0.5);
+
+                // Small vertical pop
+                Vector vel = le.getVelocity();
+                vel.setY(vel.getY() + 0.15);
+                le.setVelocity(safeFinite(vel));
             }
         }
     }
@@ -472,7 +477,7 @@ public class TideManager implements Listener {
             ));
             le.addPotionEffect(new PotionEffect(
                     PotionEffectType.WEAKNESS,
-                    durTicks,
+                    0 + durTicks,
                     0,
                     false, true, true
             ));
