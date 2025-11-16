@@ -9,10 +9,14 @@ import org.bukkit.Location;
 import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.World;
+import org.bukkit.boss.BarColor;
+import org.bukkit.boss.BarStyle;
+import org.bukkit.boss.BossBar;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
@@ -30,629 +34,808 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
+/**
+ * TideWielder core — Maelstrom / Bubble / Tidepool / Surge / Typhoon + Tidal Momentum passive.
+ *
+ * v0.4.0 — Winder-style input (movement + F + sneak only), max FX but optimized, aerial Typhoon.
+ *
+ * Controls (when attuned to TideWielder):
+ *  - Tap F (swap-hand)                    -> Surge
+ *  - Double-tap F                         -> Maelstrom
+ *  - Sneak + tap F                        -> Bubble
+ *  - Quick sneak tap (ground)             -> Tidepool
+ *  - Sneak + double-tap F                 -> Typhoon (Evo 3 only, aerial cyclone)
+ */
 public class TideManager implements Listener {
 
     private final TideWielderPlugin plugin;
-    private final IEvoService evo;
+    private final IEvoService evo; // nullable
 
     private final Map<UUID, TidePlayerData> data = new HashMap<>();
+    private final Map<UUID, BossBar> bars = new HashMap<>();
+    private final Map<UUID, LastCooldown> lastCooldown = new HashMap<>();
+
+    // Passive flow tracking
+    private final Map<UUID, FlowState> flows = new HashMap<>();
+
+    // F-tap state (for Surge / Bubble / Maelstrom / Typhoon)
     private final Map<UUID, FTapState> fTaps = new HashMap<>();
+
+    // Sneak state (for Tidepool quick tap)
     private final Map<UUID, SneakState> sneaks = new HashMap<>();
-    private final Map<UUID, FlowInfo> flows = new HashMap<>();
 
     private BukkitTask tickTask;
 
-    // Base cooldowns (ms)
-    private static final long GRASP_CD   = 11_000L;
-    private static final long PRISON_CD  = 14_000L;
-    private static final long POOL_CD    = 9_000L;
-    private static final long WAVE_CD    = 7_000L;
-    private static final long TYPHOON_CD = 60_000L;
+    // Cooldowns (ms)
+    private static final long MAELSTROM_CD_BASE = 10_000L;
+    private static final long BUBBLE_CD_BASE    = 14_000L;
+    private static final long TIDEPOOL_CD_BASE  = 10_000L;
+    private static final long SURGE_CD_BASE     = 8_000L;
+    private static final long TYPHOON_CD_BASE   = 120_000L;
 
-    // Evo CDR
-    private static final double[] CDR = {1.0, 0.9, 0.8, 0.7};
+    // Typhoon timings
+    private static final long TYPHOON_DURATION_BASE = 4_000L;
+    private static final long TYPHOON_TICK_MS       = 350L;
 
-    // Input timing
-    private static final long F_TAP_MS = 260L;
-    private static final long F_TAP_TICKS = 6L;
+    // Geometry
+    private static final double MAELSTROM_RADIUS = 6.0;
+    private static final double SURGE_RADIUS     = 10.0;
+    private static final double SURGE_FORCE      = 0.8;
+
+    // Evo CDR factors
+    private static final double[] CDR = {1.00, 0.90, 0.75, 0.55};
+
+    // Tidal Momentum tuning
+    private static final double FLOW_GAIN_PER_BLOCK   = 0.45;
+    private static final double FLOW_DECAY_PER_SECOND = 0.35;
+    private static final double FLOW_TRIGGER_MIN      = 0.45;
+    private static final long   FLOW_BURST_COOLDOWN   = 1500L;
+
+    // F input timing (ms / ticks)
+    private static final long F_TAP_WINDOW_MS    = 260L;
+    private static final long F_TAP_WINDOW_TICKS = 6L;
+
+    // Sneak tap window (for Tidepool)
     private static final long SNEAK_TAP_TICKS = 6L;
-
-    // Passive
-    private static final double FLOW_GAIN_PER_BLOCK = 0.45;
-    private static final double FLOW_DECAY_PER_SEC = 0.35;
-    private static final double FLOW_TRIGGER_MIN = 0.45;
-    private static final long FLOW_BURST_CD = 1500L;
 
     public TideManager(TideWielderPlugin plugin, IEvoService evo) {
         this.plugin = plugin;
         this.evo = evo;
         Bukkit.getPluginManager().registerEvents(this, plugin);
-        tickTask = new Tick().runTaskTimer(plugin, 1L, 1L);
+        this.tickTask = new TickTask().runTaskTimer(plugin, 1L, 1L);
     }
 
     public TidePlayerData data(Player p) {
-        return data.computeIfAbsent(p.getUniqueId(), id -> new TidePlayerData(id));
+        return data.computeIfAbsent(p.getUniqueId(), k -> new TidePlayerData(p.getUniqueId()));
     }
 
     public void shutdown() {
-        if (tickTask != null) tickTask.cancel();
-        HandlerList.unregisterAll(this);
-        data.clear();
+        if (tickTask != null) {
+            try { tickTask.cancel(); } catch (Throwable ignored) {}
+            tickTask = null;
+        }
+        for (BossBar b : bars.values()) {
+            try { b.setVisible(false); b.removeAll(); } catch (Throwable ignored) {}
+        }
+        bars.clear();
+        lastCooldown.clear();
+        flows.clear();
         fTaps.clear();
         sneaks.clear();
-        flows.clear();
+        HandlerList.unregisterAll(this);
     }
 
-    // ----------------------------------------------------------------
+    // ------------------------------------------------------------
     // Events
-    // ----------------------------------------------------------------
+    // ------------------------------------------------------------
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
         Player p = e.getPlayer();
         data(p);
-        TideAccessBridge.warm(p);
+        warmAccess(p);
+        clearAB(p);
     }
 
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
         Player p = e.getPlayer();
-        fTaps.remove(p.getUniqueId());
-        sneaks.remove(p.getUniqueId());
+        clearAB(p);
         flows.remove(p.getUniqueId());
+        FTapState ft = fTaps.remove(p.getUniqueId());
+        if (ft != null && ft.pending != null) {
+            try { ft.pending.cancel(); } catch (Throwable ignored) {}
+        }
+        SneakState ss = sneaks.remove(p.getUniqueId());
+        if (ss != null && ss.pending != null) {
+            try { ss.pending.cancel(); } catch (Throwable ignored) {}
+        }
     }
 
-    // F: tap / double-tap
+    /**
+     * F input: tap / double-tap, with sneak as modifier.
+     *
+     *  - Tap F, not sneaking              -> Surge
+     *  - Tap F, sneaking                  -> Bubble
+     *  - Double-tap F                     -> Maelstrom
+     *  - Sneak + double-tap F             -> Typhoon (Evo 3 only)
+     */
     @EventHandler(ignoreCancelled = true)
     public void onSwap(PlayerSwapHandItemsEvent e) {
         Player p = e.getPlayer();
         if (!TideAccessBridge.canUseTide(p)) return;
+
+        // Prevent actual item swap when using Tide
         e.setCancelled(true);
 
-        long now = System.currentTimeMillis();
         UUID id = p.getUniqueId();
-        FTapState st = fTaps.computeIfAbsent(id, k -> new FTapState());
+        long now = System.currentTimeMillis();
 
-        if (st.pending != null) {
-            st.pending.cancel();
-            st.pending = null;
+        FTapState state = fTaps.computeIfAbsent(id, k -> new FTapState());
+        // Cancel any pending single-tap cast, we'll reschedule or double-tap
+        if (state.pending != null) {
+            try { state.pending.cancel(); } catch (Throwable ignored) {}
+            state.pending = null;
         }
 
-        if (st.firstTapAt > 0 && now - st.firstTapAt <= F_TAP_MS) {
-            boolean sneakEither = st.firstSneak || p.isSneaking();
-            st.firstTapAt = 0;
-            st.firstSneak = false;
-            st.pending = null;
+        if (state.firstTapAt > 0L && (now - state.firstTapAt) <= F_TAP_WINDOW_MS) {
+            // Double-tap detected
+            boolean sneakEither = p.isSneaking() || state.firstTapSneak;
 
             if (sneakEither) {
+                // Sneak + double-tap -> Typhoon (if Evo 3)
                 triggerTyphoon(p);
             } else {
-                triggerGrasp(p);
+                // Normal double-tap -> Maelstrom
+                triggerMaelstrom(p);
             }
+
+            state.firstTapAt = 0L;
+            state.firstTapSneak = false;
+            state.pending = null;
             return;
         }
 
-        st.firstTapAt = now;
-        st.firstSneak = p.isSneaking();
-        st.pending = new BukkitRunnable() {
-            final long tapTime = now;
-            final boolean sneak = st.firstSneak;
+        // First tap of a possible single
+        state.firstTapAt = now;
+        state.firstTapSneak = p.isSneaking();
 
+        // Schedule single-tap resolution after a short window
+        state.pending = new BukkitRunnable() {
             @Override
             public void run() {
-                if (st.firstTapAt != tapTime) return;
-                st.firstTapAt = 0;
-                st.firstSneak = false;
-                st.pending = null;
-                if (sneak) triggerPrison(p);
-                else triggerWave(p);
+                // If still same tap (no second tap intervened)
+                if (state.firstTapAt == now) {
+                    if (state.firstTapSneak) {
+                        triggerBubble(p);
+                    } else {
+                        triggerSurge(p);
+                    }
+                    state.firstTapAt = 0L;
+                    state.firstTapSneak = false;
+                    state.pending = null;
+                }
             }
-        }.runTaskLater(plugin, F_TAP_TICKS);
+        }.runTaskLater(plugin, F_TAP_WINDOW_TICKS);
     }
 
-    // Sneak: quick tap = pool OR bubble escape
+    /**
+     * Sneak quick tap: Tidepool.
+     *
+     * - If player taps sneak quickly (press + release), we treat it as Tidepool.
+     * - If they hold sneak, nothing happens (no accidental spam while crouching).
+     */
     @EventHandler(ignoreCancelled = true)
     public void onSneak(PlayerToggleSneakEvent e) {
         Player p = e.getPlayer();
-        TidePlayerData d = data(p);
-
-        // Bubble escape for ANY imprisoned player
-        if (d.isInPrison()) {
-            if (e.isSneaking()) {
-                adjustPrisonHp(p, d, -1);
-            }
-            return;
-        }
-
         if (!TideAccessBridge.canUseTide(p)) return;
 
         UUID id = p.getUniqueId();
         SneakState ss = sneaks.computeIfAbsent(id, k -> new SneakState());
-        if (!e.isSneaking()) return; // we only care about press
 
-        if (ss.pending != null) {
-            ss.pending.cancel();
-            ss.pending = null;
-        }
-        ss.pending = new BukkitRunnable() {
-            @Override
-            public void run() {
+        if (e.isSneaking()) {
+            // Start of a potential quick tap
+            if (ss.pending != null) {
+                try { ss.pending.cancel(); } catch (Throwable ignored) {}
                 ss.pending = null;
-                if (!p.isSneaking() && p.isOnGround()) triggerPool(p);
             }
-        }.runTaskLater(plugin, SNEAK_TAP_TICKS);
+
+            ss.sneakDownAt = System.currentTimeMillis();
+
+            ss.pending = new BukkitRunnable() {
+                @Override
+                public void run() {
+                    ss.pending = null;
+                    // Quick tap detection: if player is no longer sneaking, treat it as a tap
+                    if (!p.isSneaking()) {
+                        // Ground tap only (like Gale Pull)
+                        if (p.isOnGround()) {
+                            triggerTidepool(p);
+                        }
+                    }
+                }
+            }.runTaskLater(plugin, SNEAK_TAP_TICKS);
+        } else {
+            // Sneak released; quick tap is resolved by pending task
+        }
     }
 
-    // Typhoon hits and bubble escape via attacks
-    @EventHandler(ignoreCancelled = true)
+    @EventHandler(ignoreCancelled = true, priority = EventPriority.HIGHEST)
     public void onHit(EntityDamageByEntityEvent e) {
-        if (!(e.getDamager() instanceof Player)) return;
-        Player p = (Player) e.getDamager();
+        if (!(e.getDamager() instanceof Player p)) return;
+        if (!TideAccessBridge.canUseTide(p)) return;
+
         TidePlayerData d = data(p);
         long now = System.currentTimeMillis();
-
-        // Prison attack escape
-        if (d.isInPrison()) {
-            adjustPrisonHp(p, d, -2);
-            return;
-        }
-
-        // Typhoon bolt
         if (d.isInTyphoon() && now <= d.getTyphoonActiveUntil()) {
-            LivingEntity target = e.getEntity() instanceof LivingEntity le ? le : null;
-            if (target != null) {
-                typhoonBolt(p, target);
+            Entity target = e.getEntity();
+            Location c = target.getLocation().add(0, 1.0, 0);
+            c.getWorld().spawnParticle(Particle.SPLASH, c, 18, 0.4, 0.5, 0.4, 0.02);
+            c.getWorld().spawnParticle(Particle.CLOUD, c, 8, 0.3, 0.4, 0.3, 0.01);
+            c.getWorld().playSound(c, Sound.WEATHER_RAIN_ABOVE, 0.8f, 1.4f);
+
+            if (target instanceof LivingEntity le) {
+                le.damage(0.5, p);
+                le.setVelocity(le.getVelocity().add(new Vector(0, 0.15, 0)));
             }
         }
     }
 
-    // ----------------------------------------------------------------
-    // Tick
-    // ----------------------------------------------------------------
+    // ------------------------------------------------------------
+    // Command helpers
+    // ------------------------------------------------------------
 
-    private final class Tick extends BukkitRunnable {
-        @Override
-        public void run() {
-            long now = System.currentTimeMillis();
-            for (Player p : Bukkit.getOnlinePlayers()) {
-                TidePlayerData d = data(p);
+    public void onRuneRevoked(Player p) {
+        try {
+            BossBar b = bars.remove(p.getUniqueId());
+            if (b != null) b.removeAll();
+            lastCooldown.remove(p.getUniqueId());
+            flows.remove(p.getUniqueId());
 
-                // Tidal Momentum only for rune holders
-                if (TideAccessBridge.canUseTide(p)) {
-                    updateFlow(p, d, now);
-                }
-
-                // Aqua Prison upkeep
-                if (d.isInPrison()) {
-                    if (now >= d.getPrisonExpiresAt() || d.getPrisonHp() <= 0 || p.isDead()) {
-                        clearPrison(p, d);
-                    } else {
-                        prisonTickFx(p);
-                    }
-                }
-
-                // Pool duration
-                if (d.isInPool() && now >= d.getPoolExpiresAt()) {
-                    d.setInPool(false);
-                }
-
-                // Pool effects
-                if (d.isInPool()) {
-                    poolTickEffects(p);
-                }
-
-                // Typhoon upkeep
-                if (d.isInTyphoon()) {
-                    if (now >= d.getTyphoonActiveUntil() || p.isDead()) {
-                        d.setInTyphoon(false);
-                    } else {
-                        typhoonTickFx(p, d, now);
-                    }
-                }
+            FTapState ft = fTaps.remove(p.getUniqueId());
+            if (ft != null && ft.pending != null) {
+                try { ft.pending.cancel(); } catch (Throwable ignored) {}
             }
-        }
+            SneakState ss = sneaks.remove(p.getUniqueId());
+            if (ss != null && ss.pending != null) {
+                try { ss.pending.cancel(); } catch (Throwable ignored) {}
+            }
+
+            clearAB(p);
+        } catch (Throwable ignored) {}
     }
 
-    // ----------------------------------------------------------------
-    // Ability triggers
-    // ----------------------------------------------------------------
+    public void armStartWindow(Player p, long windowMs) {
+        // Reserved for future gating if needed
+    }
 
-    // AB1 - Mariner’s Grasp (double-F)
-    private void triggerGrasp(Player p) {
-        if (!TideAccessBridge.canUseTide(p)) return;
+    private void warmAccess(Player p) {
+        try { TideAccessBridge.warm(p); } catch (Throwable ignored) {}
+    }
+
+    // ------------------------------------------------------------
+    // Abilities (with optimized FX)
+    // ------------------------------------------------------------
+
+    private void triggerMaelstrom(Player p) {
+        long now = System.currentTimeMillis();
         TidePlayerData d = data(p);
-        long now = System.currentTimeMillis();
-        if (!checkCd(p, d.getGraspReadyAt(), "Mariner’s Grasp")) return;
+        if (!checkCd(p, d.getMaelstromReadyAt(), "Maelstrom")) return;
 
-        LivingEntity target = raycastTarget(p, 14);
-        if (target == null) {
-            sendAB(p, "§cNo target for §bMariner’s Grasp§c.");
-            return;
-        }
-
-        int evoLvl = getEvo(p);
-        double dmgHearts = TideEvoBridge.graspDamage(p);
-        double stunSec = TideEvoBridge.graspStunSeconds(p);
-        int slowAmp = TideEvoBridge.graspSlowAmp(p);
-        double slowMulti = TideEvoBridge.graspSlowDuration(p);
-
-        Location c = target.getLocation().add(0, 0.5, 0);
-        World w = c.getWorld();
-
-        // FX swirl
-        w.playSound(c, Sound.BLOCK_WATER_AMBIENT, 0.9f, 1.4f);
-        w.playSound(c, Sound.ITEM_TRIDENT_RIPTIDE_1, 0.9f, 0.7f);
-        int pts = 26;
-        for (int y = 0; y < 6; y++) {
-            double yy = 0.2 + y * 0.25;
-            double r = 1.0 + y * 0.1;
-            for (int i = 0; i < pts; i++) {
-                double a = 2 * Math.PI * i / pts + y * 0.4;
-                double x = Math.cos(a) * r;
-                double z = Math.sin(a) * r;
-                w.spawnParticle(Particle.SPLASH, c.clone().add(x, yy, z), 1, 0, 0, 0, 0);
-            }
-        }
-
-        // Slow
-        int slowTicks = (int) (30 * slowMulti);
-        target.addPotionEffect(new PotionEffect(PotionEffectType.SLOW, slowTicks, slowAmp, false, true, true));
-
-        // Stun via strong slowness for short duration
-        if (stunSec > 0) {
-            int stunTicks = (int) (stunSec * 20);
-            target.addPotionEffect(new PotionEffect(PotionEffectType.SLOW, stunTicks, 10, false, true, true));
-        }
-
-        // Damage
-        if (dmgHearts > 0 && target != p) {
-            double dmg = dmgHearts * 2.0;
-            target.damage(dmg, p);
-        }
-
-        long cd = withCdr(p, GRASP_CD);
-        d.setGraspReadyAt(now + cd);
-        sendAB(p, "§b§lMariner’s Grasp! §fWater surges and binds your target!");
-    }
-
-    // AB2 - Aqua Prison (sneak + tap F)
-    private void triggerPrison(Player p) {
-        if (!TideAccessBridge.canUseTide(p)) return;
-        TidePlayerData casterData = data(p);
-        long now = System.currentTimeMillis();
-        if (!checkCd(p, casterData.getPrisonReadyAt(), "Aqua Prison")) return;
-
-        LivingEntity target = raycastTarget(p, 14);
-        if (target == null) {
-            sendAB(p, "§cNo target for §3Aqua Prison§c.");
-            return;
-        }
-
-        TidePlayerData td = (target instanceof Player pl) ? data(pl) : null;
-
-        int hp = TideEvoBridge.prisonHp(p);
-        double durSec = TideEvoBridge.prisonDuration(p);
-        long expires = now + (long) (durSec * 1000L);
-
-        if (td != null) {
-            td.setInPrison(true);
-            td.setPrisonHp(hp);
-            td.setPrisonExpiresAt(expires);
-        }
-
-        // FX bubble
-        Location c = target.getLocation().add(0, 1, 0);
-        World w = c.getWorld();
-        w.playSound(c, Sound.BLOCK_BUBBLE_COLUMN_UPWARDS_AMBIENT, 0.9f, 1.4f);
-        int rings = 3;
-        int pts = 20;
-        for (int r = 0; r < rings; r++) {
-            double rad = 1.0 + r * 0.25;
-            double y = 0.3 + r * 0.5;
-            for (int i = 0; i < pts; i++) {
-                double a = 2 * Math.PI * i / pts;
-                double x = Math.cos(a) * rad;
-                double z = Math.sin(a) * rad;
-                w.spawnParticle(Particle.WATER_BUBBLE, c.clone().add(x, y, z), 1, 0, 0, 0, 0);
-            }
-        }
-
-        long cd = withCdr(p, PRISON_CD);
-        casterData.setPrisonReadyAt(now + cd);
-        sendAB(p, "§3§lAqua Prison! §fYour foe is trapped inside a water sphere!");
-    }
-
-    // AB3 - Tidebreaker Pool (quick sneak tap)
-    private void triggerPool(Player p) {
-        if (!TideAccessBridge.canUseTide(p)) return;
-        TidePlayerData d = data(p);
-        long now = System.currentTimeMillis();
-        if (!checkCd(p, d.getPoolReadyAt(), "Tidebreaker Pool")) return;
-
-        d.setInPool(true);
-        double durSec = TideEvoBridge.poolDurationSeconds(p);
-        d.setPoolExpiresAt(now + (long) (durSec * 1000L));
-
-        Location c = p.getLocation().clone().subtract(0, 1, 0);
-        World w = c.getWorld();
-        w.playSound(c, Sound.BLOCK_WATER_AMBIENT, 0.9f, 1.1f);
-
-        int pts = 26;
-        for (int i = 0; i < pts; i++) {
-            double a = 2 * Math.PI * i / pts;
-            double x = Math.cos(a) * 2.2;
-            double z = Math.sin(a) * 2.2;
-            w.spawnParticle(Particle.DRIPPING_WATER, c.clone().add(x, 0.2, z), 1, 0, 0, 0, 0);
-        }
-
-        long cd = withCdr(p, POOL_CD);
-        d.setPoolReadyAt(now + cd);
-        sendAB(p, "§9§lTidebreaker Pool! §fSacred water empowers you!");
-    }
-
-    // AB4 - Riptide Wave (tap F)
-    private void triggerWave(Player p) {
-        if (!TideAccessBridge.canUseTide(p)) return;
-        TidePlayerData d = data(p);
-        long now = System.currentTimeMillis();
-        if (!checkCd(p, d.getWaveReadyAt(), "Riptide Wave")) return;
-
-        int evoLvl = getEvo(p);
-        double dmgHearts = TideEvoBridge.waveDamage(p);
-        int slowAmp = TideEvoBridge.waveSlowAmp(p);
-        double forceMul = TideEvoBridge.waveForce(p);
+        int evoLvl = evoLevel(p);
+        double radius = MAELSTROM_RADIUS * TideEvoBridge.m(p, "maelstrom");
 
         Location c = p.getLocation();
-        World w = c.getWorld();
-        Vector dir = c.getDirection().normalize();
 
-        w.playSound(c, Sound.ITEM_TRIDENT_RIPTIDE_2, 0.9f, 1.2f);
+        // Core sound
+        c.getWorld().playSound(c, Sound.ITEM_TRIDENT_RIPTIDE_1, 0.9f, 0.6f);
+        c.getWorld().playSound(c, Sound.BLOCK_WATER_AMBIENT, 0.8f, 1.5f);
 
-        // FX arc
-        int steps = 4;
-        int side = 10;
-        for (int s = 1; s <= steps; s++) {
-            double dist = 1.4 * s;
-            Location center = c.clone().add(dir.clone().multiply(dist)).add(0, 0.3, 0);
-            for (int i = -side; i <= side; i++) {
-                double off = i / (double) side;
-                Vector sideV = new Vector(-dir.getZ(), 0, dir.getX()).normalize().multiply(off * 1.3);
-                w.spawnParticle(Particle.SPLASH, center.clone().add(sideV), 1, 0.02, 0.02, 0.02, 0);
+        // Triple swirling rings around player (optimized points)
+        int rings = 3;
+        int points = 28;
+        for (int r = 0; r < rings; r++) {
+            double ringRadius = (radius * 0.4) + (r * radius * 0.2);
+            double yOffset = 0.5 + 0.4 * r;
+            for (int i = 0; i < points; i++) {
+                double angle = (2 * Math.PI * i / points) + (r * 0.7);
+                double x = Math.cos(angle) * ringRadius;
+                double z = Math.sin(angle) * ringRadius;
+                Location pt = c.clone().add(x, yOffset, z);
+                c.getWorld().spawnParticle(Particle.SPLASH, pt, 1, 0.02, 0.02, 0.02, 0.0);
+                if (evoLvl >= 2 && i % 4 == 0) {
+                    c.getWorld().spawnParticle(Particle.CLOUD, pt, 1, 0.01, 0.01, 0.01, 0.0);
+                }
             }
         }
 
-        double radius = 6.0;
-        for (Entity e : w.getNearbyEntities(c, radius, radius, radius)) {
-            if (!(e instanceof LivingEntity le) || le == p) continue;
-            Vector to = le.getLocation().toVector().subtract(c.toVector());
-            double dot = to.normalize().dot(dir);
-            boolean front = dot > 0.0;
-            Vector push = front ? dir.clone() : dir.clone().multiply(-1);
-            push.multiply(0.9 * forceMul);
-            push.setY(0.1);
-            le.setVelocity(push);
-
-            if (dmgHearts > 0) le.damage(dmgHearts * 2.0, p);
-            if (slowAmp > 0) le.addPotionEffect(new PotionEffect(PotionEffectType.SLOW, 40 + evoLvl * 10, slowAmp, false, true, true));
+        // Vertical vortex column (sparser)
+        for (double y = 0; y <= 3.0; y += 0.35) {
+            double scale = 0.7 + (y / 3.0);
+            double angle = y * 2.5;
+            double x = Math.cos(angle) * radius * 0.25 * scale;
+            double z = Math.sin(angle) * radius * 0.25 * scale;
+            Location pt = c.clone().add(x, y, z);
+            c.getWorld().spawnParticle(Particle.DRIPPING_WATER, pt, 1, 0.05, 0.05, 0.05, 0.01);
         }
 
-        long cd = withCdr(p, WAVE_CD);
-        d.setWaveReadyAt(now + cd);
-        sendAB(p, "§b§lRiptide Wave! §fThe tide obeys your command!");
-    }
-    // Ult - Celestial Typhoon (sneak + double-F)
-    private void triggerTyphoon(Player p) {
-        if (!TideAccessBridge.canUseTide(p)) return;
-        TidePlayerData d = data(p);
-        long now = System.currentTimeMillis();
-        if (!checkCd(p, d.getTyphoonReadyAt(), "Celestial Typhoon")) return;
+        // Mechanical effect
+        for (Entity e : p.getWorld().getNearbyEntities(c, radius, radius, radius)) {
+            if (!(e instanceof LivingEntity le) || le == p) continue;
+            Vector dir = safeUnit(c.toVector().subtract(le.getLocation().toVector()));
+            Vector tangent = new Vector(-dir.getZ(), 0, dir.getX());
+            Vector swirl = tangent.multiply(0.4).add(dir.multiply(0.15));
+            le.setVelocity(safeFinite(le.getVelocity().add(swirl)));
+            le.addPotionEffect(new PotionEffect(
+                    PotionEffectType.SLOWNESS,
+                    40,
+                    evoLvl >= 2 ? 2 : 1,
+                    false, true, true
+            ));
+        }
 
-        int evoLvl = getEvo(p);
+        long cd = cdFromEvo(p, MAELSTROM_CD_BASE);
+        d.setMaelstromReadyAt(now + cd);
+        showCooldown(p, "Maelstrom", now, now + cd, BarColor.BLUE);
+        sendAB(p, ChatColor.AQUA + "Maelstrom" + ChatColor.WHITE + " cast.");
+    }
+
+    private void triggerBubble(Player p) {
+        long now = System.currentTimeMillis();
+        TidePlayerData d = data(p);
+        if (!checkCd(p, d.getBubbleReadyAt(), "Bubble")) return;
+
+        int evoLvl = evoLevel(p);
+        double radius = 4.0;
+        Location c = p.getLocation().add(p.getLocation().getDirection().normalize().multiply(3));
+
+        // Sounds
+        c.getWorld().playSound(c, Sound.BLOCK_BUBBLE_COLUMN_WHIRLPOOL_INSIDE, 0.9f, 1.4f);
+        c.getWorld().playSound(c, Sound.BLOCK_BUBBLE_COLUMN_UPWARDS_AMBIENT, 0.7f, 1.2f);
+
+        // Rising spiral of bubbles (optimized steps)
+        int steps = 20;
+        for (int i = 0; i < steps; i++) {
+            double t = i / (double) steps;
+            double y = 0.3 + t * 3.0;
+            double angle = t * Math.PI * 4;
+            double r = 1.2 + (evoLvl * 0.1);
+            double x = Math.cos(angle) * r;
+            double z = Math.sin(angle) * r;
+            Location pt = c.clone().add(x, y, z);
+            c.getWorld().spawnParticle(Particle.BUBBLE_COLUMN_UP, pt, 1, 0.04, 0.04, 0.04, 0.0);
+            if (i % 3 == 0) {
+                c.getWorld().spawnParticle(Particle.SPLASH, pt, 1, 0.03, 0.03, 0.03, 0.0);
+            }
+        }
+
+        // Bubble "cage"
+        int ringPoints = 26;
+        for (int i = 0; i < ringPoints; i++) {
+            double angle = 2 * Math.PI * i / ringPoints;
+            double x = Math.cos(angle) * radius;
+            double z = Math.sin(angle) * radius;
+            for (double y = 0.5; y <= 3.0; y += 0.75) {
+                Location pt = c.clone().add(x, y, z);
+                c.getWorld().spawnParticle(Particle.DRIPPING_WATER, pt, 1, 0.02, 0.02, 0.02, 0.01);
+            }
+        }
+
+        for (Entity e : p.getWorld().getNearbyEntities(c, radius, radius, radius)) {
+            if (!(e instanceof LivingEntity le) || le == p) continue;
+            le.addPotionEffect(new PotionEffect(
+                    PotionEffectType.SLOWNESS,
+                    60 + (evoLvl * 20),
+                    3,
+                    false, true, true
+            ));
+            le.addPotionEffect(new PotionEffect(
+                    PotionEffectType.WEAKNESS,
+                    60 + (evoLvl * 20),
+                    0,
+                    false, true, true
+            ));
+        }
+
+        long dur = 2000L + evoLvl * 1000L;
+        d.setInBubble(true);
+        d.setBubbleExpiresAt(now + dur);
+
+        long cd = cdFromEvo(p, BUBBLE_CD_BASE);
+        d.setBubbleReadyAt(now + cd);
+        showCooldown(p, "Bubble", now, now + cd, BarColor.BLUE);
+        sendAB(p, ChatColor.AQUA + "Bubble" + ChatColor.WHITE + " cast.");
+    }
+
+    private void triggerTidepool(Player p) {
+        long now = System.currentTimeMillis();
+        TidePlayerData d = data(p);
+        if (!checkCd(p, d.getTidepoolReadyAt(), "Tidepool")) return;
+
+        int evoLvl = evoLevel(p);
+        Location base = p.getLocation().clone().subtract(0, 1, 0);
+        World w = base.getWorld();
+
+        // Pulsing water sigil: 3 short rings
+        double maxR = 3.0;
+        int points = 28;
+        for (int ring = 0; ring < 3; ring++) {
+            double r = maxR * (0.3 + 0.2 * ring);
+            double y = 0.05 + 0.02 * ring;
+            for (int i = 0; i < points; i++) {
+                double angle = 2 * Math.PI * i / points;
+                double x = Math.cos(angle) * r;
+                double z = Math.sin(angle) * r;
+                Location pt = base.clone().add(x, y, z);
+                w.spawnParticle(Particle.DRIPPING_WATER, pt, 1, 0.01, 0.01, 0.01, 0.0);
+                if (ring == 0 && i % 4 == 0) {
+                    w.spawnParticle(Particle.SPLASH, pt.clone().add(0, 0.15, 0), 1, 0.01, 0.01, 0.01, 0.0);
+                }
+            }
+        }
+
+        w.spawnParticle(Particle.SPLASH, base.clone().add(0, 1, 0), 20, 1.0, 0.2, 1.0, 0.02);
+        w.playSound(base, Sound.BLOCK_WATER_AMBIENT, 0.9f, 1.0f);
+        if (evoLvl >= 2) {
+            w.playSound(base, Sound.BLOCK_BEACON_POWER_SELECT, 0.5f, 1.5f);
+        }
+
+        double radius = 3.0;
+        for (Entity e : w.getNearbyEntities(base, radius, 1.5, radius)) {
+            if (!(e instanceof LivingEntity le)) continue;
+            if (le == p) {
+                le.addPotionEffect(new PotionEffect(
+                        PotionEffectType.SPEED,
+                        60 + evoLvl * 40,
+                        1,
+                        false, true, true
+                ));
+                if (evoLvl >= 2) {
+                    le.addPotionEffect(new PotionEffect(
+                            PotionEffectType.REGENERATION,
+                            60 + evoLvl * 40,
+                            0,
+                            false, true, true
+                    ));
+                }
+            } else {
+                le.addPotionEffect(new PotionEffect(
+                        PotionEffectType.SLOWNESS,
+                        60 + evoLvl * 40,
+                        2,
+                        false, true, true
+                ));
+            }
+        }
+
+        long cd = cdFromEvo(p, TIDEPOOL_CD_BASE);
+        d.setTidepoolReadyAt(now + cd);
+        showCooldown(p, "Tidepool", now, now + cd, BarColor.BLUE);
+        sendAB(p, ChatColor.AQUA + "Tidepool" + ChatColor.WHITE + " cast.");
+    }
+
+    private void triggerSurge(Player p) {
+        long now = System.currentTimeMillis();
+        TidePlayerData d = data(p);
+        if (!checkCd(p, d.getSurgeReadyAt(), "Surge")) return;
+
+        int evoLvl = evoLevel(p);
+        double radius = SURGE_RADIUS * TideEvoBridge.m(p, "surge");
+        double baseForce = SURGE_FORCE * TideEvoBridge.m(p, "surge");
+
+        // Tidal Momentum synergy: extra force if you had built flow
+        FlowState fs = flows.get(p.getUniqueId());
+        double flowFactor = (fs != null ? fs.flow : 0.0);
+        double force = baseForce * (1.0 + 0.35 * flowFactor);
+        if (fs != null) fs.flow = 0.0;
+
+        Location c = p.getLocation();
+        Vector dir = p.getLocation().getDirection().normalize();
+
+        // Sweeping wave arc in front (optimized density)
+        int waveSteps = 4;
+        int sideSamples = 10;
+        for (int step = 1; step <= waveSteps; step++) {
+            double dist = 1.6 * step;
+            Location center = c.clone().add(dir.clone().multiply(dist)).add(0, 0.2, 0);
+            for (int i = -sideSamples; i <= sideSamples; i++) {
+                double offset = i / (double) sideSamples;
+                Vector side = new Vector(-dir.getZ(), 0, dir.getX()).normalize().multiply(offset * 1.2 * (1 + 0.08 * evoLvl));
+                Location pt = center.clone().add(side);
+                c.getWorld().spawnParticle(Particle.SPLASH, pt, 1, 0.04, 0.06, 0.04, 0.0);
+                if (step == waveSteps && Math.abs(i) % 3 == 0) {
+                    c.getWorld().spawnParticle(Particle.DRIPPING_WATER, pt.clone().add(0, 0.15, 0), 1, 0.01, 0.03, 0.01, 0.0);
+                }
+            }
+        }
+
+        c.getWorld().playSound(c, Sound.ITEM_TRIDENT_RIPTIDE_2, 0.9f, 1.2f);
+        c.getWorld().playSound(c, Sound.BLOCK_WATER_AMBIENT, 0.8f, 1.6f);
+
+        for (Entity e : p.getWorld().getNearbyEntities(c, radius, radius, radius)) {
+            if (!(e instanceof LivingEntity le) || le == p) continue;
+            Vector to = safeUnit(le.getLocation().toVector().subtract(c.toVector()));
+            double dot = to.dot(dir);
+            boolean inFront = dot > 0.25;
+
+            Vector push = (inFront ? dir : dir.clone().multiply(-1)).multiply(force);
+            push.setY(Math.max(-0.2, Math.min(0.6, push.getY())));
+            le.setVelocity(safeFinite(le.getVelocity().add(push)));
+
+            if (evoLvl >= 2) {
+                le.addPotionEffect(new PotionEffect(
+                        PotionEffectType.SLOWNESS,
+                        40,
+                        1,
+                        false, true, true
+                ));
+            }
+        }
+
+        long cd = cdFromEvo(p, SURGE_CD_BASE);
+        d.setSurgeReadyAt(now + cd);
+        showCooldown(p, "Surge", now, now + cd, BarColor.BLUE);
+        sendAB(p, ChatColor.AQUA + "Surge" + ChatColor.WHITE + " cast.");
+    }
+
+    public void triggerTyphoon(Player p) {
+        long now = System.currentTimeMillis();
+        TidePlayerData d = data(p);
+        if (!TideAccessBridge.canUseTide(p)) return;
+
+        int evoLvl = evoLevel(p);
+        // Evo 3 requirement
         if (evoLvl < 3) {
-            sendAB(p, "§cCelestial Typhoon unlocks at §bEvo III§c.");
+            sendAB(p, ChatColor.RED + "Typhoon unlocks at Evo 3.");
             return;
         }
 
-        double durMul = TideEvoBridge.typhoonDuration(p);
-        long durMs = (long) (6000L * durMul);
+        if (now < d.getTyphoonReadyAt()) {
+            long left = d.getTyphoonReadyAt() - now;
+            int sec = (int) Math.ceil(left / 1000.0);
+            sendAB(p, ChatColor.RED + "Typhoon on cooldown (" + sec + "s)");
+            return;
+        }
 
+        long dur = (long) (TYPHOON_DURATION_BASE * TideEvoBridge.m(p, "typhoon"));
         d.setInTyphoon(true);
-        d.setTyphoonActiveUntil(now + durMs);
+        d.setTyphoonActiveUntil(now + dur);
+        d.setTyphoonNextBoltAt(now + 350L);
+
+        // Give a slight upward launch and slow-fall vibe
+        Vector v = p.getVelocity();
+        v.setY(Math.max(v.getY(), 0.7));
+        p.setVelocity(safeFinite(v));
+        p.addPotionEffect(new PotionEffect(
+                PotionEffectType.SLOW_FALLING,
+                (int) (dur / 50L) + 10,
+                0,
+                false, false, true
+        ));
 
         Location c = p.getLocation().add(0, 4, 0);
         World w = c.getWorld();
-        w.playSound(c, Sound.WEATHER_RAIN_ABOVE, 1.0f, 0.8f);
-        w.playSound(c, Sound.BLOCK_WATER_AMBIENT, 0.8f, 1.4f);
 
-        int pts = 24;
-        for (int i = 0; i < pts; i++) {
-            double a = 2 * Math.PI * i / pts;
-            double x = Math.cos(a) * 2.4;
-            double z = Math.sin(a) * 2.4;
-            w.spawnParticle(Particle.CLOUD, c.clone().add(x, 0, z), 1, 0.02, 0.02, 0.02, 0);
-        }
-
-        long cd = withCdr(p, TYPHOON_CD);
-        d.setTyphoonReadyAt(now + cd);
-        sendAB(p, "§3§l§nCELESTIAL TYPHOON!§r §bThe heavens answer your call!");
-    }
-
-    private void typhoonBolt(Player caster, LivingEntity target) {
-        double dmgHearts = TideEvoBridge.typhoonDamage(caster);
-        int slowAmp = TideEvoBridge.typhoonSlowAmp(caster);
-
-        Location top = target.getLocation().add(0, 6, 0);
-        World w = top.getWorld();
-        w.playSound(top, Sound.WEATHER_RAIN_ABOVE, 0.6f, 1.5f);
-
-        int pts = 16;
-        for (int i = 0; i < pts; i++) {
-            double a = 2 * Math.PI * i / pts;
-            double x = Math.cos(a) * 0.7;
-            double z = Math.sin(a) * 0.7;
-            w.spawnParticle(Particle.DRIPPING_WATER, top.clone().add(x, 0, z), 1, 0, 0, 0, 0.02);
-        }
-        w.spawnParticle(Particle.SPLASH, target.getLocation().add(0, 1, 0), 12, 0.4, 0.3, 0.4, 0.06);
-
-        if (dmgHearts > 0) target.damage(dmgHearts * 2.0, caster);
-        target.addPotionEffect(new PotionEffect(PotionEffectType.SLOW, 16, slowAmp, false, true, true));
-    }
-
-    private void typhoonTickFx(Player p, TidePlayerData d, long now) {
-        Location c = p.getLocation().add(0, 3.2, 0);
-        World w = c.getWorld();
-        w.spawnParticle(Particle.DRIPPING_WATER, c, 10, 2.2, 0.8, 2.2, 0.03);
-        if (now % 800L < 60L) {
-            w.playSound(c, Sound.WEATHER_RAIN_ABOVE, 0.4f, 1.2f);
-        }
-    }
-
-    // Aqua Prison recurring FX
-    private void prisonTickFx(Player prisoner) {
-        Location c = prisoner.getLocation().add(0, 1, 0);
-        World w = c.getWorld();
-        w.spawnParticle(Particle.WATER_BUBBLE, c, 8, 0.6, 0.8, 0.6, 0.02);
-
-        Vector v = prisoner.getVelocity();
-        v.setY(Math.max(v.getY(), 0.05));
-        v.setX(v.getX() * 0.2);
-        v.setZ(v.getZ() * 0.2);
-        prisoner.setVelocity(v);
-
-        prisoner.addPotionEffect(new PotionEffect(PotionEffectType.SLOW, 5, 3, false, false, false));
-    }
-
-    private void clearPrison(Player prisoner, TidePlayerData d) {
-        d.setInPrison(false);
-        d.setPrisonHp(0);
-        d.setPrisonExpiresAt(0L);
-        Location c = prisoner.getLocation().add(0, 1, 0);
-        World w = c.getWorld();
-        w.spawnParticle(Particle.SPLASH, c, 18, 0.6, 0.6, 0.6, 0.08);
-        w.playSound(c, Sound.ENTITY_PLAYER_SPLASH_HIGH_SPEED, 0.9f, 1.4f);
-    }
-
-    private void adjustPrisonHp(Player prisoner, TidePlayerData d, int delta) {
-        if (!d.isInPrison()) return;
-        int hp = Math.max(0, d.getPrisonHp() + delta);
-        d.setPrisonHp(hp);
-
-        Location c = prisoner.getLocation().add(0, 1, 0);
-        World w = c.getWorld();
-        w.spawnParticle(Particle.WATER_BUBBLE, c, 4, 0.5, 0.5, 0.5, 0.02);
-
-        if (hp <= 0 || System.currentTimeMillis() >= d.getPrisonExpiresAt()) {
-            clearPrison(prisoner, d);
-        }
-    }
-
-    // Tidebreaker pool logic (buff self, debuff enemies)
-    private void poolTickEffects(Player p) {
-        TidePlayerData d = data(p);
-        Location c = p.getLocation();
-        World w = c.getWorld();
-
-        int evoLvl = getEvo(p);
-        int slowAmp = TideEvoBridge.poolSlowAmp(p);
-        double speedBoost = TideEvoBridge.poolSpeedBoost(p);
-        int regenAmp = TideEvoBridge.poolRegenAmp(p);
-
-        double radius = 3.0;
-        for (Entity e : w.getNearbyEntities(c, radius, 1.5, radius)) {
-            if (!(e instanceof LivingEntity le)) continue;
-            boolean self = (le == p);
-            if (self) {
-                le.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 10, (int) Math.round(speedBoost * 2), false, false, false));
-                if (regenAmp > 0) {
-                    le.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, 10, regenAmp, false, false, false));
+        // Initial multi-layer storm ring (optimized)
+        for (int layer = 0; layer < 3; layer++) {
+            double r = 2.0 + layer * 0.8;
+            int pts = 28;
+            double y = layer * 0.4;
+            for (int i = 0; i < pts; i++) {
+                double ang = 2 * Math.PI * i / pts;
+                double x = Math.cos(ang) * r;
+                double z = Math.sin(ang) * r;
+                Location pt = c.clone().add(x, y, z);
+                w.spawnParticle(Particle.CLOUD, pt, 1, 0.03, 0.03, 0.03, 0.0);
+                if (layer == 2 && i % 4 == 0) {
+                    w.spawnParticle(Particle.SPLASH, pt.clone().add(0, 0.2, 0), 1, 0.04, 0.04, 0.04, 0.0);
                 }
-            } else {
-                le.addPotionEffect(new PotionEffect(PotionEffectType.SLOW, 10 + evoLvl * 5, slowAmp, false, true, true));
             }
         }
 
-        w.spawnParticle(Particle.DRIPPING_WATER, c.clone().subtract(0, 0.7, 0), 6, 1.8, 0.2, 1.8, 0.03);
+        w.playSound(c, Sound.WEATHER_RAIN_ABOVE, 1.2f, 0.8f);
+        w.playSound(c, Sound.ENTITY_DROWNED_HURT_WATER, 0.8f, 1.6f);
+
+        long cd = cdFromEvo(p, TYPHOON_CD_BASE);
+        d.setTyphoonReadyAt(now + cd);
+        showCooldown(p, "Typhoon", now, now + cd, BarColor.BLUE);
+        sendAB(p, ChatColor.AQUA + "Typhoon" + ChatColor.WHITE + " unleashed.");
     }
 
-    // Tidal Momentum passive
-    private void updateFlow(Player p, TidePlayerData d, long now) {
-        FlowInfo fi = flows.computeIfAbsent(p.getUniqueId(), k -> new FlowInfo());
-        Location loc = p.getLocation();
-        if (fi.lastLoc != null) {
-            double dt = (now - fi.lastTime) / 1000.0;
-            if (dt < 0) dt = 0;
+    // ------------------------------------------------------------
+    // Tick — passive upkeep, typhoon, bossbar, etc.
+    // ------------------------------------------------------------
 
-            double dx = loc.getX() - fi.lastLoc.getX();
-            double dz = loc.getZ() - fi.lastLoc.getZ();
-            double dist = Math.hypot(dx, dz);
+    private final class TickTask extends BukkitRunnable {
+        @Override
+        public void run() {
+            long now = System.currentTimeMillis();
+
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                if (!TideAccessBridge.canUseTide(p)) continue;
+
+                TidePlayerData d = data(p);
+
+                // Passive: Tidal Momentum
+                updateFlow(p, d, now);
+
+                // Typhoon upkeep FX
+                if (d.isInTyphoon()) {
+                    if (now >= d.getTyphoonActiveUntil()) {
+                        d.setInTyphoon(false);
+                        clearAB(p);
+
+                        // Ending splash shockwave when Typhoon ends
+                        Location end = p.getLocation();
+                        World w = end.getWorld();
+                        w.spawnParticle(Particle.SPLASH, end.clone().add(0, 1, 0),
+                                32, 1.5, 0.3, 1.5, 0.08);
+                        w.playSound(end, Sound.ENTITY_PLAYER_SPLASH_HIGH_SPEED, 1.0f, 1.0f);
+
+                    } else {
+                        double left = (d.getTyphoonActiveUntil() - now) / 1000.0;
+                        sendAB(p, ChatColor.AQUA + "Typhoon: " + ChatColor.WHITE +
+                                String.format(java.util.Locale.US, "%.1fs", Math.max(0.0, left)));
+
+                        if (now >= d.getTyphoonNextBoltAt()) {
+                            d.setTyphoonNextBoltAt(now + TYPHOON_TICK_MS);
+
+                            Location c = p.getLocation().add(0, 4, 0);
+                            World w = c.getWorld();
+
+                            // Spinning inner spiral (optimized)
+                            int pts = 20;
+                            double r = 2.2;
+                            for (int i = 0; i < pts; i++) {
+                                double t = (now / 220.0) + i * (2 * Math.PI / pts);
+                                double x = Math.cos(t) * r;
+                                double z = Math.sin(t) * r;
+                                Location pt = c.clone().add(x, 0, z);
+                                w.spawnParticle(Particle.SPLASH, pt, 1, 0.05, 0.05, 0.05, 0.02);
+                            }
+
+                            // Gentle rain around player
+                            w.spawnParticle(Particle.DRIPPING_WATER, p.getLocation().add(0, 2.0, 0),
+                                    16, 2.3, 1.4, 2.3, 0.03);
+
+                            w.playSound(c, Sound.WEATHER_RAIN_ABOVE, 0.7f, 1.3f);
+                        }
+                    }
+                }
+
+                // Bossbar cooldown progress
+                BossBar b = bars.get(p.getUniqueId());
+                if (b != null) {
+                    LastCooldown lc = lastCooldown.get(p.getUniqueId());
+                    if (lc == null) {
+                        b.setVisible(false);
+                    } else {
+                        long start = lc.startMs();
+                        long end = lc.endMs();
+                        if (now >= end) {
+                            b.setVisible(false);
+                        } else {
+                            double total = Math.max(1.0, (double) (end - start));
+                            double left = Math.max(0.0, (double) (end - now));
+                            double prog = Math.max(0.0, Math.min(1.0, 1.0 - (left / total)));
+                            b.setProgress(prog);
+                            String secs = String.format(java.util.Locale.US, "%.1fs", left / 1000.0);
+                            b.setTitle(ChatColor.AQUA + lc.label() + ChatColor.GRAY + " cooldown • " + secs);
+                            if (!b.isVisible()) b.setVisible(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Passive flow logic (Tidal Momentum)
+    // ------------------------------------------------------------
+
+    private static final class FlowState {
+        double flow = 0.0;
+        Location lastLoc = null;
+        long lastUpdate = 0L;
+        long lastBurstAt = 0L;
+    }
+
+    private void updateFlow(Player p, TidePlayerData d, long now) {
+        FlowState fs = flows.computeIfAbsent(p.getUniqueId(), id -> new FlowState());
+        Location loc = p.getLocation();
+
+        if (fs.lastLoc != null) {
+            double dtSec = (now - fs.lastUpdate) / 1000.0;
+            if (dtSec < 0) dtSec = 0;
+
+            Vector lastV = fs.lastLoc.toVector();
+            Vector curV  = loc.toVector();
+            lastV.setY(0); curV.setY(0);
+            double dist = curV.distance(lastV);
             boolean moving = dist > 0.04;
 
-            fi.flow = Math.max(0.0, fi.flow - FLOW_DECAY_PER_SEC * dt);
+            fs.flow = Math.max(0.0, fs.flow - FLOW_DECAY_PER_SECOND * dtSec);
+
             if (moving && p.isOnGround() && !p.isSneaking()) {
-                fi.flow = Math.min(1.0, fi.flow + dist * FLOW_GAIN_PER_BLOCK);
+                fs.flow = Math.min(1.0, fs.flow + dist * FLOW_GAIN_PER_BLOCK);
             }
 
-            if (!moving && fi.flow >= FLOW_TRIGGER_MIN && now - fi.lastBurstAt >= FLOW_BURST_CD) {
-                p.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, 20, 0, false, false, true));
-                Location c = loc.clone().add(0, 0.2, 0);
-                World w = c.getWorld();
-                w.spawnParticle(Particle.SPLASH, c, 10, 0.4, 0.2, 0.4, 0.04);
-                w.playSound(c, Sound.BLOCK_WATER_AMBIENT, 0.5f, 1.6f);
-                fi.lastBurstAt = now;
-                fi.flow = 0.0;
-            }
-        }
-        fi.lastLoc = loc.clone();
-        fi.lastTime = now;
-        d.setFlow(fi.flow);
-    }
+            if (!moving && fs.flow >= FLOW_TRIGGER_MIN && now - fs.lastBurstAt >= FLOW_BURST_COOLDOWN) {
+                int evoLvl = evoLevel(p);
+                int amp = (evoLvl >= 3 ? 1 : 0);
+                int duration = 20;
 
-    // Raycast-ish target finder in front of player
-    private LivingEntity raycastTarget(Player p, double maxDist) {
-        Location c = p.getLocation();
-        Vector dir = c.getDirection().normalize();
-        World w = c.getWorld();
-        LivingEntity best = null;
-        double bestDist = maxDist + 1;
+                p.addPotionEffect(new PotionEffect(
+                        PotionEffectType.SPEED,
+                        duration,
+                        amp,
+                        false, false, true
+                ));
 
-        for (Entity e : w.getNearbyEntities(c, maxDist, maxDist, maxDist)) {
-            if (!(e instanceof LivingEntity le) || le == p) continue;
-            Vector to = le.getLocation().toVector().subtract(c.toVector());
-            double dist = to.length();
-            if (dist > maxDist) continue;
-            to.normalize();
-            double dot = to.dot(dir);
-            if (dot < 0.4) continue; // must be in front cone
-            if (dist < bestDist) {
-                bestDist = dist;
-                best = le;
+                Location c = loc.clone().add(0, 0.15, 0);
+                c.getWorld().spawnParticle(Particle.SPLASH, c, 14, 0.25, 0.08, 0.25, 0.04);
+                c.getWorld().spawnParticle(Particle.CLOUD, c, 5, 0.18, 0.10, 0.18, 0.01);
+                c.getWorld().playSound(c, Sound.BLOCK_WATER_AMBIENT, 0.6f, 1.5f);
+
+                fs.lastBurstAt = now;
+                fs.flow = 0.0;
             }
         }
-        return best;
+
+        fs.lastLoc = loc.clone();
+        fs.lastUpdate = now;
     }
 
-    private boolean checkCd(Player p, long readyAt, String name) {
-        long now = System.currentTimeMillis();
-        if (now >= readyAt) return true;
-        long left = readyAt - now;
-        double sec = left / 1000.0;
-        sendAB(p, "§c" + name + " on cooldown (" + String.format("%.1f", sec) + "s)");
-        return false;
+    // ------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------
+
+    private record LastCooldown(String label, long startMs, long endMs) {}
+
+    private static final class FTapState {
+        long firstTapAt = 0L;
+        boolean firstTapSneak = false;
+        BukkitTask pending = null;
     }
 
-    private long withCdr(Player p, long base) {
-        int lvl = getEvo(p);
-        if (lvl < 0 || lvl > 3) return base;
-        return (long) (base * CDR[lvl]);
+    private static final class SneakState {
+        long sneakDownAt = 0L;
+        BukkitTask pending = null;
     }
 
-    private int getEvo(Player p) {
-        try {
-            if (evo != null) {
+    private int evoLevel(Player p) {
+        if (evo != null) {
+            try {
                 return Math.max(0, Math.min(3, evo.getEvoLevel(p.getUniqueId())));
-            }
-        } catch (Throwable ignored) {}
-        return 0;
+            } catch (Throwable ignored) {}
+        }
+        return TideEvoBridge.evo(p);
+    }
+
+    private boolean checkCd(Player p, long readyAt, String label) {
+        long now = System.currentTimeMillis();
+        if (now < readyAt) {
+            long left = readyAt - now;
+            int sec = (int) Math.ceil(left / 1000.0);
+            sendAB(p, ChatColor.RED + label + " on cooldown (" + sec + "s)");
+            return false;
+        }
+        return true;
+    }
+
+    private long cdFromEvo(Player p, long base) {
+        int lvl = evoLevel(p);
+        double factor = CDR[Math.max(0, Math.min(3, lvl))];
+        return (long) Math.max(0L, Math.floor(base * factor));
+    }
+
+    private void showCooldown(Player p, String label, long startMs, long endMs, BarColor color) {
+        BossBar bar = bars.computeIfAbsent(p.getUniqueId(), id ->
+                Bukkit.createBossBar(ChatColor.AQUA + label, color, BarStyle.SEGMENTED_10));
+        bar.setColor(color);
+        bar.addPlayer(p);
+        bar.setVisible(true);
+        lastCooldown.put(p.getUniqueId(), new LastCooldown(label, startMs, endMs));
     }
 
     private void sendAB(Player p, String msg) {
@@ -663,24 +846,25 @@ public class TideManager implements Listener {
         }
     }
 
-    // ----------------------------------------------------------------
-    // Inner state classes
-    // ----------------------------------------------------------------
-
-    private static final class FTapState {
-        long firstTapAt = 0L;
-        boolean firstSneak = false;
-        BukkitTask pending = null;
+    private void clearAB(Player p) {
+        try {
+            p.spigot().sendMessage(ChatMessageType.ACTION_BAR, new TextComponent(""));
+        } catch (Throwable ignored) {
+        }
     }
 
-    private static final class SneakState {
-        BukkitTask pending = null;
+    private Vector safeUnit(Vector v) {
+        if (v == null) return new Vector(0, 1, 0);
+        double len = v.length();
+        if (!Double.isFinite(len) || len < 1.0e-6) return new Vector(0, 1, 0);
+        return v.multiply(1.0 / len);
     }
 
-    private static final class FlowInfo {
-        Location lastLoc;
-        long lastTime = 0L;
-        double flow = 0.0;
-        long lastBurstAt = 0L;
+    private Vector safeFinite(Vector v) {
+        double x = v.getX(), y = v.getY(), z = v.getZ();
+        if (!Double.isFinite(x)) x = 0.0;
+        if (!Double.isFinite(y)) y = 0.0;
+        if (!Double.isFinite(z)) z = 0.0;
+        return new Vector(x, y, z);
     }
 }
