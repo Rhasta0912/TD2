@@ -35,9 +35,9 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * TideWielder core — Maelstrom / Bubble / Tidepool / Surge / Typhoon + Tidal Momentum passive.
+ * TideWielder core — Maelstrom / Bubble / Tidepool / Surge / Typhoon + Tide Echo passive.
  *
- * v0.4.0 — Winder-style input (movement + F + sneak only), max FX but optimized, aerial Typhoon.
+ * v0.4.1 — Winder-style input (movement + F + sneak only), max FX but optimized, aerial Typhoon.
  *
  * Controls (when attuned to TideWielder):
  *  - Tap F (swap-hand)                    -> Surge
@@ -55,8 +55,12 @@ public class TideManager implements Listener {
     private final Map<UUID, BossBar> bars = new HashMap<>();
     private final Map<UUID, LastCooldown> lastCooldown = new HashMap<>();
 
-    // Passive flow tracking
+    // Passive flow tracking (legacy, kept for minimal change)
     private final Map<UUID, FlowState> flows = new HashMap<>();
+
+    // Passive: Tide Echo
+    private static final long TIDE_ECHO_DURATION_MS = 4000L;
+    private final Map<UUID, EchoState> echoes = new HashMap<>();
 
     // F-tap state (for Surge / Bubble / Maelstrom / Typhoon)
     private final Map<UUID, FTapState> fTaps = new HashMap<>();
@@ -85,7 +89,7 @@ public class TideManager implements Listener {
     // Evo CDR factors
     private static final double[] CDR = {1.00, 0.90, 0.75, 0.55};
 
-    // Tidal Momentum tuning
+    // Tidal Momentum tuning (legacy)
     private static final double FLOW_GAIN_PER_BLOCK   = 0.45;
     private static final double FLOW_DECAY_PER_SECOND = 0.35;
     private static final double FLOW_TRIGGER_MIN      = 0.45;
@@ -120,6 +124,7 @@ public class TideManager implements Listener {
         bars.clear();
         lastCooldown.clear();
         flows.clear();
+        echoes.clear();
         fTaps.clear();
         sneaks.clear();
         HandlerList.unregisterAll(this);
@@ -142,6 +147,7 @@ public class TideManager implements Listener {
         Player p = e.getPlayer();
         clearAB(p);
         flows.remove(p.getUniqueId());
+        echoes.remove(p.getUniqueId());
         FTapState ft = fTaps.remove(p.getUniqueId());
         if (ft != null && ft.pending != null) {
             try { ft.pending.cancel(); } catch (Throwable ignored) {}
@@ -291,6 +297,7 @@ public class TideManager implements Listener {
             if (b != null) b.removeAll();
             lastCooldown.remove(p.getUniqueId());
             flows.remove(p.getUniqueId());
+            echoes.remove(p.getUniqueId());
 
             FTapState ft = fTaps.remove(p.getUniqueId());
             if (ft != null && ft.pending != null) {
@@ -314,7 +321,7 @@ public class TideManager implements Listener {
     }
 
     // ------------------------------------------------------------
-    // Abilities (with optimized FX)
+    // Abilities (with optimized FX) + Tide Echo hooks
     // ------------------------------------------------------------
 
     private void triggerMaelstrom(Player p) {
@@ -322,6 +329,7 @@ public class TideManager implements Listener {
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getMaelstromReadyAt(), "Maelstrom")) return;
 
+        boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
         double radius = MAELSTROM_RADIUS * TideEvoBridge.m(p, "maelstrom");
 
@@ -366,10 +374,16 @@ public class TideManager implements Listener {
             Vector tangent = new Vector(-dir.getZ(), 0, dir.getX());
             Vector swirl = tangent.multiply(0.4).add(dir.multiply(0.15));
             le.setVelocity(safeFinite(le.getVelocity().add(swirl)));
+            int amp = (evoLvl >= 2 ? 2 : 1);
+            int dur = 40;
+            if (echo) {
+                amp++;
+                dur += 20;
+            }
             le.addPotionEffect(new PotionEffect(
                     PotionEffectType.SLOWNESS,
-                    40,
-                    evoLvl >= 2 ? 2 : 1,
+                    dur,
+                    amp,
                     false, true, true
             ));
         }
@@ -378,6 +392,7 @@ public class TideManager implements Listener {
         d.setMaelstromReadyAt(now + cd);
         showCooldown(p, "Maelstrom", now, now + cd, BarColor.BLUE);
         sendAB(p, ChatColor.AQUA + "Maelstrom" + ChatColor.WHITE + " cast.");
+        activateEcho(p, now);
     }
 
     private void triggerBubble(Player p) {
@@ -385,6 +400,7 @@ public class TideManager implements Listener {
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getBubbleReadyAt(), "Bubble")) return;
 
+        boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
         double radius = 4.0;
         Location c = p.getLocation().add(p.getLocation().getDirection().normalize().multiply(3));
@@ -423,18 +439,29 @@ public class TideManager implements Listener {
 
         for (Entity e : p.getWorld().getNearbyEntities(c, radius, radius, radius)) {
             if (!(e instanceof LivingEntity le) || le == p) continue;
+            int baseDur = 60 + (evoLvl * 20);
+            int dur = baseDur + (echo ? 20 : 0);
+
             le.addPotionEffect(new PotionEffect(
                     PotionEffectType.SLOWNESS,
-                    60 + (evoLvl * 20),
+                    dur,
                     3,
                     false, true, true
             ));
             le.addPotionEffect(new PotionEffect(
                     PotionEffectType.WEAKNESS,
-                    60 + (evoLvl * 20),
+                    dur,
                     0,
                     false, true, true
             ));
+            if (echo) {
+                le.addPotionEffect(new PotionEffect(
+                        PotionEffectType.BLINDNESS,
+                        30,
+                        0,
+                        false, true, true
+                ));
+            }
         }
 
         long dur = 2000L + evoLvl * 1000L;
@@ -445,6 +472,7 @@ public class TideManager implements Listener {
         d.setBubbleReadyAt(now + cd);
         showCooldown(p, "Bubble", now, now + cd, BarColor.BLUE);
         sendAB(p, ChatColor.AQUA + "Bubble" + ChatColor.WHITE + " cast.");
+        activateEcho(p, now);
     }
 
     private void triggerTidepool(Player p) {
@@ -452,6 +480,7 @@ public class TideManager implements Listener {
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getTidepoolReadyAt(), "Tidepool")) return;
 
+        boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
         Location base = p.getLocation().clone().subtract(0, 1, 0);
         World w = base.getWorld();
@@ -505,6 +534,14 @@ public class TideManager implements Listener {
                         2,
                         false, true, true
                 ));
+                if (echo) {
+                    le.addPotionEffect(new PotionEffect(
+                            PotionEffectType.WEAKNESS,
+                            40 + evoLvl * 20,
+                            0,
+                            false, true, true
+                    ));
+                }
             }
         }
 
@@ -512,6 +549,7 @@ public class TideManager implements Listener {
         d.setTidepoolReadyAt(now + cd);
         showCooldown(p, "Tidepool", now, now + cd, BarColor.BLUE);
         sendAB(p, ChatColor.AQUA + "Tidepool" + ChatColor.WHITE + " cast.");
+        activateEcho(p, now);
     }
 
     private void triggerSurge(Player p) {
@@ -519,15 +557,13 @@ public class TideManager implements Listener {
         TidePlayerData d = data(p);
         if (!checkCd(p, d.getSurgeReadyAt(), "Surge")) return;
 
+        boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
         double radius = SURGE_RADIUS * TideEvoBridge.m(p, "surge");
         double baseForce = SURGE_FORCE * TideEvoBridge.m(p, "surge");
 
-        // Tidal Momentum synergy: extra force if you had built flow
-        FlowState fs = flows.get(p.getUniqueId());
-        double flowFactor = (fs != null ? fs.flow : 0.0);
-        double force = baseForce * (1.0 + 0.35 * flowFactor);
-        if (fs != null) fs.flow = 0.0;
+        // Tide Echo synergy: stronger wave when chaining abilities
+        double force = baseForce * (echo ? 1.25 : 1.0);
 
         Location c = p.getLocation();
         Vector dir = p.getLocation().getDirection().normalize();
@@ -576,6 +612,7 @@ public class TideManager implements Listener {
         d.setSurgeReadyAt(now + cd);
         showCooldown(p, "Surge", now, now + cd, BarColor.BLUE);
         sendAB(p, ChatColor.AQUA + "Surge" + ChatColor.WHITE + " cast.");
+        activateEcho(p, now);
     }
 
     public void triggerTyphoon(Player p) {
@@ -583,6 +620,7 @@ public class TideManager implements Listener {
         TidePlayerData d = data(p);
         if (!TideAccessBridge.canUseTide(p)) return;
 
+        boolean echo = isEchoActive(p, now);
         int evoLvl = evoLevel(p);
         // Evo 3 requirement
         if (evoLvl < 3) {
@@ -597,7 +635,7 @@ public class TideManager implements Listener {
             return;
         }
 
-        long dur = (long) (TYPHOON_DURATION_BASE * TideEvoBridge.m(p, "typhoon"));
+        long dur = (long) (TYPHOON_DURATION_BASE * TideEvoBridge.m(p, "typhoon") * (echo ? 1.25 : 1.0));
         d.setInTyphoon(true);
         d.setTyphoonActiveUntil(now + dur);
         d.setTyphoonNextBoltAt(now + 350L);
@@ -636,6 +674,8 @@ public class TideManager implements Listener {
         w.playSound(c, Sound.WEATHER_RAIN_ABOVE, 1.2f, 0.8f);
         w.playSound(c, Sound.ENTITY_DROWNED_HURT_WATER, 0.8f, 1.6f);
 
+        activateEcho(p, now);
+
         long cd = cdFromEvo(p, TYPHOON_CD_BASE);
         d.setTyphoonReadyAt(now + cd);
         showCooldown(p, "Typhoon", now, now + cd, BarColor.BLUE);
@@ -643,7 +683,7 @@ public class TideManager implements Listener {
     }
 
     // ------------------------------------------------------------
-    // Tick — passive upkeep, typhoon, bossbar, etc.
+    // Tick — passive upkeep, Typhoon, bossbar, etc.
     // ------------------------------------------------------------
 
     private final class TickTask extends BukkitRunnable {
@@ -656,8 +696,8 @@ public class TideManager implements Listener {
 
                 TidePlayerData d = data(p);
 
-                // Passive: Tidal Momentum
-                updateFlow(p, d, now);
+                // Passive: Tide Echo — ambient effect while an echo is active
+                tickEchoVisual(p, now);
 
                 // Typhoon upkeep FX
                 if (d.isInTyphoon()) {
@@ -730,9 +770,38 @@ public class TideManager implements Listener {
     }
 
     // ------------------------------------------------------------
-    // Passive flow logic (Tidal Momentum)
+    // Passive flow logic (Tidal Momentum) + Tide Echo helpers
     // ------------------------------------------------------------
 
+    // Passive Tide Echo state
+    private static final class EchoState {
+        long activeUntil;
+    }
+
+    private boolean isEchoActive(Player p, long now) {
+        EchoState es = echoes.get(p.getUniqueId());
+        return es != null && now <= es.activeUntil;
+    }
+
+    private void activateEcho(Player p, long now) {
+        EchoState es = echoes.computeIfAbsent(p.getUniqueId(), id -> new EchoState());
+        es.activeUntil = now + TIDE_ECHO_DURATION_MS;
+
+        // Small burst when a new echo is set
+        Location c = p.getLocation().add(0, 1.1, 0);
+        c.getWorld().spawnParticle(Particle.SPLASH, c, 8, 0.3, 0.2, 0.3, 0.02);
+        c.getWorld().spawnParticle(Particle.CLOUD, c, 3, 0.2, 0.15, 0.2, 0.01);
+    }
+
+    private void tickEchoVisual(Player p, long now) {
+        EchoState es = echoes.get(p.getUniqueId());
+        if (es == null || now > es.activeUntil) return;
+
+        Location c = p.getLocation().add(0, 0.2, 0);
+        c.getWorld().spawnParticle(Particle.DRIPPING_WATER, c, 3, 0.25, 0.05, 0.25, 0.01);
+    }
+
+    // Legacy flow state (no longer used, kept for minimal code movement)
     private static final class FlowState {
         double flow = 0.0;
         Location lastLoc = null;
