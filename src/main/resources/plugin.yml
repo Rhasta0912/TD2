@@ -1,0 +1,25 @@
+name: TideWielder
+main: com.stellinova.tidewielder.TideWielderPlugin
+version: 0.1.0
+api-version: '1.21'
+author: Stellinova
+description: Water control rune — Maelstrom, Bubbles, Tidepools and Typhoons (EvoCore powered).
+
+depend: [ ]
+softdepend:
+  - EvoCore
+  - PlaceholderAPI
+
+commands:
+  tidewielder:
+    description: Main command for the TideWielder rune.
+    usage: /tidewielder
+    aliases: [tide]
+    permission: tidewielder.command
+permissions:
+  tidewielder.command:
+    default: true
+  tidewielder.use:
+    default: true
+  tidewielder.bypass:
+    default: op
